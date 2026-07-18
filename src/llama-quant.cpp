@@ -654,7 +654,77 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
         ++qs.i_ffn_up;
     }
+	else if (name.find(".time_mix_") != std::string::npos || name.find(".channel_mix_") != std::string::npos) {
+    int i_layer;
+    if (sscanf(name.c_str(), "blk.%d.", &i_layer) == 1) {
+        const int n_layer = qs.model.hparams.n_layer();
 
+        // "Heavy" projection layers (analogous to FFN_DOWN / ATTENTION_V)
+        bool is_heavy = (name.find("channel_mix_value.weight") != std::string::npos ||
+                         name.find("time_mix_value.weight")    != std::string::npos);
+
+        // Routing/attention layers (analogous to ATTENTION_QKV)
+        bool is_attn_qkv_equivalent = (name.find("time_mix_key.weight")        != std::string::npos ||
+                                       name.find("time_mix_receptance.weight") != std::string::npos ||
+                                       name.find("channel_mix_key.weight")     != std::string::npos);
+
+        // ---------------------------------------------------------------
+        // HEAVY LAYERS (value projections)
+        // ---------------------------------------------------------------
+        if (is_heavy) {
+            // Q3_K_S: no upgrades — falls through (all stay Q3_K)
+
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
+                // ~3.35 bpw target
+                // Top 1/16 early layers → Q5_K, strategic → Q4_K, rest → Q3_K
+                new_type = i_layer < n_layer / 16 ? GGML_TYPE_Q5_K :
+                           use_more_bits(i_layer, n_layer) ? GGML_TYPE_Q4_K :
+                           GGML_TYPE_Q3_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
+                // ~3.52 bpw target (matching standard llama Q3_K_L)
+                // Top 1/8 early layers → Q5_K, strategic → Q4_K, rest → Q3_K
+                new_type = i_layer < n_layer / 8  ? GGML_TYPE_Q5_K :
+                           use_more_bits(i_layer, n_layer) ? GGML_TYPE_Q4_K :
+                           GGML_TYPE_Q3_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S) {
+                // ~4.25 bpw target — minimal upgrades
+                if (i_layer < n_layer / 8) new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
+                // ~4.45 bpw target — strategic → Q5_K only
+                if (use_more_bits(i_layer, n_layer)) new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_S) {
+                // ~5.14 bpw — no upgrades, falls through (all stay Q5_K)
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
+                // ~5.45 bpw target — strategic → Q6_K only
+                if (use_more_bits(i_layer, n_layer)) new_type = GGML_TYPE_Q6_K;
+            }
+        }
+        // ---------------------------------------------------------------
+        // QKV-EQUIVALENT LAYERS (key, receptance)
+        // ---------------------------------------------------------------
+        else if (is_attn_qkv_equivalent) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ||
+                ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
+                // All QKV → Q4_K (+1 bpw from base Q3_K)
+                new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
+                // All QKV → Q5_K (+1 bpw from base Q4_K)
+                new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
+                // All QKV → Q6_K (+1 bpw from base Q5_K)
+                new_type = GGML_TYPE_Q6_K;
+            }
+            // _S variants fall through — retain base precision
+        }
+    }
+}
     return new_type;
 }
 
